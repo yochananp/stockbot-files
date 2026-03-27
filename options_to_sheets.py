@@ -340,6 +340,23 @@ def main():
     tickers = tickers[:MAX_TICKERS]
     log.info(f"Loaded {len(tickers)} tickers from {TICKERS_FILE}")
 
+    # Fetch alerts from stock-db API
+    alert_map = {}
+    try:
+        import requests as _req
+        resp = _req.get("http://192.168.1.2:8000/results",
+                        params={"timeframe": "1D"}, timeout=15)
+        if resp.ok:
+            for r in resp.json():
+                alert_map[r["ticker"]] = r.get("alert", "NEUTRAL")
+            log.info(f"Loaded {len(alert_map)} alerts from stock-db API")
+        else:
+            log.warning("Could not fetch alerts -- using NEUTRAL for all")
+    except Exception as e:
+        log.warning(f"Alert fetch error: {e} -- using NEUTRAL for all")
+
+    # 2. Analyze
+
     # 2. Analyze
     summary_rows  = []
     contract_rows = []
