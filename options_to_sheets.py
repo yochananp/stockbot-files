@@ -345,10 +345,18 @@ def main():
     try:
         import requests as _req
         resp = _req.get("http://192.168.1.2:8000/results",
-                        params={"timeframe": "1D"}, timeout=15)
-        if resp.ok:
-            for r in resp.json():
-                alert_map[r["ticker"]] = r.get("alert", "NEUTRAL")
+                params={"timeframe": "1D"}, timeout=15)
+if resp.ok:
+    rows = resp.json()
+    # keep only latest date per ticker, highest score wins
+    from collections import defaultdict
+    best = {}
+    for r in rows:
+        t = r["ticker"]
+        if t not in best or r.get("score", 0) > best[t].get("score", 0):
+            best[t] = r
+    for t, r in best.items():
+        alert_map[t] = r.get("alert", "NEUTRAL")
             log.info(f"Loaded {len(alert_map)} alerts from stock-db API")
         else:
             log.warning("Could not fetch alerts -- using NEUTRAL for all")
