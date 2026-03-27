@@ -327,7 +327,7 @@ def main():
     alert_map = {}
     try:
         import requests as _req
-        resp = _req.get(f"{STOCK_DB_URL}/results",
+        resp = _req.get(f"{STOCK_DB_URL}/signals",
                         params={"timeframe": "1D"}, timeout=15)
         if resp.ok:
             rows = resp.json()
