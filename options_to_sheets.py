@@ -8,7 +8,6 @@ import sys
 import math
 import logging
 from datetime import datetime, date
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -41,6 +40,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+
+# Google Sheets
 
 def get_sheets_service():
     creds = None
@@ -112,6 +113,87 @@ def format_sheet(service, sheet_id, sheet_gid, num_cols):
     ).execute()
 
 
+# TA Alert (standalone — no DB needed)
+
+def _ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def compute_ta_alert(ticker):
+    """
+    Compute BUY/WATCH/NEUTRAL/BEARISH alert from yfinance daily data.
+    Logic:
+      - Above EMA150 + MACD bullish + volume rising -> BUY
+      - Above EMA150 + MACD bullish                 -> WATCH
+      - Below EMA150 + MACD bearish                 -> BEARISH
+      - Everything else                              -> NEUTRAL
+    Returns (alert, score, signals_list)
+    """
+    try:
+        hist = yf.Ticker(ticker).history(period="1y")
+        if hist is None or len(hist) < 160:
+            return "NEUTRAL", 0, ["insufficient data"]
+
+        close  = hist["Close"]
+        volume = hist["Volume"]
+
+        ema150      = _ema(close, 150)
+        above_ema   = close.iloc[-1] > ema150.iloc[-1]
+
+        ema12       = _ema(close, 12)
+        ema26       = _ema(close, 26)
+        macd_line   = ema12 - ema26
+        signal_line = _ema(macd_line, 9)
+        macd_bull   = macd_line.iloc[-1] > signal_line.iloc[-1]
+        macd_cross  = (macd_line.iloc[-2] <= signal_line.iloc[-2] and
+                       macd_line.iloc[-1] > signal_line.iloc[-1])
+
+        vol_avg20   = volume.iloc[-20:].mean()
+        vol_rising  = volume.iloc[-1] > vol_avg20 * 1.2
+
+        score = 0
+        signals = []
+
+        if above_ema:
+            score += 10
+            signals.append("above_ema150")
+        else:
+            score -= 10
+            signals.append("below_ema150")
+
+        if macd_bull:
+            score += 10
+            signals.append("macd_bullish")
+        else:
+            score -= 10
+            signals.append("macd_bearish")
+
+        if macd_cross:
+            score += 10
+            signals.append("macd_crossover")
+
+        if vol_rising:
+            score += 10
+            signals.append("volume_rising")
+
+        if score >= 30:
+            alert = "BUY"
+        elif score >= 10:
+            alert = "WATCH"
+        elif score <= -10:
+            alert = "BEARISH"
+        else:
+            alert = "NEUTRAL"
+
+        return alert, score, signals
+
+    except Exception as e:
+        log.warning(f"  [{ticker}] TA error: {e}")
+        return "NEUTRAL", 0, ["error"]
+
+
+# Black-Scholes
+
 def _d1_d2(S, K, T, r, sigma):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return None, None
@@ -127,17 +209,17 @@ def calc_greeks(S, K, T, r, sigma, opt_type="call"):
     pdf_d1 = norm.pdf(d1)
     sqrt_T = math.sqrt(T)
     if opt_type == "call":
-        delta = norm.cdf(d1)
-        theta = (-(S * pdf_d1 * sigma) / (2 * sqrt_T)
-                 - r * K * math.exp(-r * T) * norm.cdf(d2)) / 365
+        delta    = norm.cdf(d1)
+        theta    = (-(S * pdf_d1 * sigma) / (2 * sqrt_T)
+                    - r * K * math.exp(-r * T) * norm.cdf(d2)) / 365
         bs_price = S * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2)
     else:
-        delta = norm.cdf(d1) - 1
-        theta = (-(S * pdf_d1 * sigma) / (2 * sqrt_T)
-                 + r * K * math.exp(-r * T) * norm.cdf(-d2)) / 365
+        delta    = norm.cdf(d1) - 1
+        theta    = (-(S * pdf_d1 * sigma) / (2 * sqrt_T)
+                    + r * K * math.exp(-r * T) * norm.cdf(-d2)) / 365
         bs_price = K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
     gamma = pdf_d1 / (S * sigma * sqrt_T)
-    vega = S * pdf_d1 * sqrt_T / 100
+    vega  = S * pdf_d1 * sqrt_T / 100
     return {
         "delta":    round(delta, 4),
         "gamma":    round(gamma, 6),
@@ -191,13 +273,14 @@ def recommend_strategy(alert, iv_rank):
         return strat, f"IV Rank {iv_rank:.0f} - high IV, sell premium"
     buying = [s for s in candidates if s in ("Long Call", "Bull Call Spread")]
     strat = buying[0] if buying else candidates[0]
-    rationale = f"IV Rank {iv_rank:.0f} - low IV, buy premium" if iv_rank else f"{strat} - IV unavailable"
+    rationale = (f"IV Rank {iv_rank:.0f} - low IV, buy premium"
+                 if iv_rank else f"{strat} - IV unavailable")
     return strat, rationale
 
 
 def analyze_ticker(ticker, alert="NEUTRAL"):
     try:
-        tkr = yf.Ticker(ticker)
+        tkr  = yf.Ticker(ticker)
         info = tkr.fast_info
         spot = float(info.last_price) if info.last_price else None
         if not spot:
@@ -217,17 +300,18 @@ def analyze_ticker(ticker, alert="NEUTRAL"):
         iv_current = None
         try:
             chain_near = tkr.option_chain(all_exps[0])
-            atm = chain_near.calls.iloc[(chain_near.calls["strike"] - spot).abs().argsort()[:3]]
+            atm = chain_near.calls.iloc[
+                (chain_near.calls["strike"] - spot).abs().argsort()[:3]]
             iv_current = float(atm["impliedVolatility"].mean())
         except Exception:
             pass
 
         iv_rank = None
         try:
-            hist_1y = tkr.history(period="1y")
-            log_ret = np.log(hist_1y["Close"] / hist_1y["Close"].shift(1)).dropna()
+            hist_1y  = tkr.history(period="1y")
+            log_ret  = np.log(hist_1y["Close"] / hist_1y["Close"].shift(1)).dropna()
             roll_vol = log_ret.rolling(30).std() * math.sqrt(252)
-            iv_list = roll_vol.dropna().tolist()
+            iv_list  = roll_vol.dropna().tolist()
             if iv_current and iv_list:
                 iv_rank = calc_iv_rank(iv_list, iv_current)
         except Exception:
@@ -239,17 +323,17 @@ def analyze_ticker(ticker, alert="NEUTRAL"):
         best_contracts = []
         for exp in filtered[:4]:
             dte = _days_to_expiry(exp)
-            T = dte / 365.0
+            T   = dte / 365.0
             try:
                 chain = tkr.option_chain(exp)
-                df = chain.calls if opt_type == "call" else chain.puts
-                df = df[df["strike"].between(spot * 0.80, spot * 1.20)]
+                df    = chain.calls if opt_type == "call" else chain.puts
+                df    = df[df["strike"].between(spot * 0.80, spot * 1.20)]
                 iv_fallback = iv_current or 0.30
 
-                best = None
+                best       = None
                 best_score = -1
                 for _, row in df.iterrows():
-                    iv = float(row.get("impliedVolatility", iv_fallback) or iv_fallback)
+                    iv  = float(row.get("impliedVolatility", iv_fallback) or iv_fallback)
                     if iv <= 0 or iv > 5:
                         iv = iv_fallback
                     bid = float(row.get("bid", 0) or 0)
@@ -257,12 +341,13 @@ def analyze_ticker(ticker, alert="NEUTRAL"):
                     mid = (bid + ask) / 2 if ask > 0 else float(row.get("lastPrice", 0) or 0)
                     if mid <= 0:
                         continue
-                    oi_raw = row.get("openInterest", 0)
-                    oi = int(oi_raw) if pd.notna(oi_raw) else 0
+                    oi_raw  = row.get("openInterest", 0)
+                    oi      = int(oi_raw) if pd.notna(oi_raw) else 0
                     vol_raw = row.get("volume", 0)
-                    vol = int(vol_raw) if pd.notna(vol_raw) else 0
+                    vol     = int(vol_raw) if pd.notna(vol_raw) else 0
                     spread_pct = ((ask - bid) / mid * 100) if mid > 0 else 999
-                    greeks = calc_greeks(spot, float(row["strike"]), T, RISK_FREE_RATE, iv, opt_type)
+                    greeks = calc_greeks(spot, float(row["strike"]), T,
+                                         RISK_FREE_RATE, iv, opt_type)
                     if not greeks:
                         continue
                     delta = abs(greeks["delta"])
@@ -308,6 +393,8 @@ def analyze_ticker(ticker, alert="NEUTRAL"):
         return None
 
 
+# Main
+
 def main():
     log.info("=" * 60)
     log.info("Options to Google Sheets - starting")
@@ -324,41 +411,27 @@ def main():
     tickers = tickers[:MAX_TICKERS]
     log.info(f"Loaded {len(tickers)} tickers from {TICKERS_FILE}")
 
-    alert_map = {}
-    try:
-        import requests as _req
-        resp = _req.get(f"{STOCK_DB_URL}/signals",
-                        params={"timeframe": "1D"}, timeout=15)
-        if resp.ok:
-            rows = resp.json()
-            best = {}
-            for r in rows:
-                t = r["ticker"]
-                if t not in best or r.get("score", 0) > best[t].get("score", 0):
-                    best[t] = r
-            for t, r in best.items():
-                alert_map[t] = r.get("alert", "NEUTRAL")
-            log.info(f"Loaded {len(alert_map)} alerts from stock-db API")
-        else:
-            log.warning("Could not fetch alerts - using NEUTRAL for all")
-    except Exception as e:
-        log.warning(f"Alert fetch error: {e} - using NEUTRAL for all")
-
-    summary_rows = []
+    summary_rows  = []
     contract_rows = []
 
     for i, ticker in enumerate(tickers):
-        log.info(f"  [{i+1}/{len(tickers)}] {ticker}")
-        alert = alert_map.get(ticker, "NEUTRAL")
+        log.info(f"  [{i+1}/{len(tickers)}] {ticker} - computing TA...")
+
+        # Compute TA alert directly from yfinance
+        alert, ta_score, ta_signals = compute_ta_alert(ticker)
+        log.info(f"    TA: {alert} (score={ta_score}, signals={ta_signals})")
+
         result = analyze_ticker(ticker, alert=alert)
         if not result:
-            log.warning(f"  [{ticker}] skipped - no data")
+            log.warning(f"  [{ticker}] skipped - no options data")
             continue
 
         summary_rows.append([
             result["run_date"],
             result["ticker"],
             result["alert"],
+            ta_score,
+            ", ".join(ta_signals),
             result["spot"],
             f"{result['iv_pct']}%" if result["iv_pct"] else "-",
             result["iv_rank"] if result["iv_rank"] is not None else "-",
@@ -394,11 +467,12 @@ def main():
         sys.exit(1)
 
     log.info("Authenticating with Google Sheets...")
-    service = get_sheets_service()
+    service  = get_sheets_service()
     sheet_id = create_sheet(service, SHEET_TITLE)
 
     summary_header = [
-        "Date", "Ticker", "Alert", "Spot", "IV%", "IV Rank", "Strategy", "Rationale"
+        "Date", "Ticker", "Alert", "TA Score", "TA Signals",
+        "Spot", "IV%", "IV Rank", "Strategy", "Rationale"
     ]
     write_to_sheet(service, sheet_id, "Summary", [summary_header] + summary_rows)
 
@@ -411,9 +485,9 @@ def main():
 
     sheets_meta = service.spreadsheets().get(spreadsheetId=sheet_id).execute()
     for sheet in sheets_meta["sheets"]:
-        gid = sheet["properties"]["sheetId"]
+        gid   = sheet["properties"]["sheetId"]
         title = sheet["properties"]["title"]
-        cols = len(summary_header) if title == "Summary" else len(contracts_header)
+        cols  = len(summary_header) if title == "Summary" else len(contracts_header)
         format_sheet(service, sheet_id, gid, cols)
 
     log.info("=" * 60)
