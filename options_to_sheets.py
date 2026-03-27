@@ -95,7 +95,7 @@ def format_sheet(service, sheet_id: str, sheet_gid: int, num_rows: int, num_cols
                 "range": {"sheetId": sheet_gid, "startRowIndex": 0, "endRowIndex": 1,
                            "startColumnIndex": 0, "endColumnIndex": num_cols},
                 "cell": {"userEnteredFormat": {"textFormat": {"bold": True},
-                                               "backgroundColor": {"red": 0.2, "green": 0.2, "blue": 0.2}}},
+                                               "backgroundColor": {"red": 0.85, "green": 0.85, "blue": 0.85}}},
                 "fields": "userEnteredFormat(textFormat,backgroundColor)"
             }
         },
